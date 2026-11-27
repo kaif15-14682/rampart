@@ -1,0 +1,737 @@
+#!/usr/bin/env bash
+#
+# Rampart: checked, exactly-once intake for a folder of CSV files.
+#
+# Every CSV that lands in the inbox is checked against the schema for its feed, then
+# loaded into SQLite in a single transaction or held in quarantine with the reason.
+# A ledger of SHA-256 hashes makes every run safe to repeat: no file is loaded twice.
+#
+# https://github.com/kaif15-14682/rampart · MIT License
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+readonly VERSION=1.0.0
+readonly PROG=${0##*/}
+
+# ---- Settings: built-in defaults, then the config file, then the command line ----
+INBOX=./inbox
+DATA_DIR=./var
+SCHEMAS=./schemas
+RETENTION_DAYS=30
+SETTLE_SECONDS=5
+MAX_ERRORS=20
+WEBHOOK_URL=
+
+CONFIG=${RAMPART_CONFIG:-}
+DRY_RUN=0
+VERBOSE=0
+QUIET=0
+POST=0
+WATCHING=0
+SINCE=
+DAYS=
+INTERVAL=60
+
+AWK=$(command -v gawk || command -v awk || true)
+DB='' ARCHIVE='' QUARANTINE='' LOGS='' LOCK=''
+TMP=
+LOCKED=0
+COLS=() TYPES=() NEEDS=() ARGS=()
+ROWS=0 ERRORS=0 FIRST=
+LOADED=0 LOADED_ROWS=0 SKIPPED=0 HELD=0 WAITING=0
+
+readonly RE_BLANK='^[[:space:]]*(#.*)?$'
+readonly RE_SETTING='^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$'
+readonly SEP=$'\037' # between fields when awk or sqlite3 hand rows back
+
+usage() {
+	cat << EOF
+usage: $PROG [options] <command>
+
+Checked, exactly-once intake for a folder of CSV files.
+
+commands:
+  run        check and load every file waiting in the inbox
+  watch      run again every --interval seconds until stopped
+  report     what was loaded, held and skipped (--since, --post)
+  prune      delete archived files older than the retention period
+  doctor     check the tools, folders and schemas this setup needs
+  init       create the folders and the database
+
+options:
+  -c, --config FILE   settings file (default: ./rampart.conf when present)
+  -n, --dry-run       say what would happen and change nothing
+  -v, --verbose       print every log line as it is written
+  -q, --quiet         print only warnings and errors (for cron)
+      --since DAY     report: first day to include, YYYY-MM-DD (default: today, UTC)
+      --post          report: also send it to webhook_url or \$RAMPART_WEBHOOK
+      --days N        prune: archive days to keep (default: retention_days)
+      --interval N    watch: seconds between runs (default: 60)
+  -h, --help          show this help
+  -V, --version       show the version
+
+exit status: 0 ok, 1 usage or setup problem, 2 at least one file was held,
+             3 another run has the lock, 4 a required tool is missing
+EOF
+}
+
+# ---- Small helpers ----
+
+die() { # status message
+	local status=$1
+	shift
+	printf '%s: %s\n' "$PROG" "$*" >&2
+	write_log ERROR "$*"
+	exit "$status"
+}
+
+write_log() { # level message
+	[[ -n $LOGS && -d $LOGS ]] || return 0
+	((DRY_RUN == 0)) || return 0
+	printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" "$2" >> "$LOGS/rampart.log"
+}
+
+# Every line goes to the log file. On screen: everything with -v; with -q only warnings,
+# so a cron job stays silent unless something needs a person
+log() { # level message
+	write_log "$1" "$2"
+	if ((VERBOSE)) || { ((QUIET)) && [[ $1 == WARN ]]; }; then
+		printf '%s %s\n' "$1" "$2" >&2
+	fi
+}
+
+need() { command -v "$1" > /dev/null 2>&1 || die 4 "$1 is required but was not found"; }
+
+# SQL goes in on stdin, never as an argument. The Windows build of sqlite3 ends lines with CRLF,
+# and tr keeps the output the same everywhere
+sql() { # statements as arguments, or on stdin
+	if (($#)); then
+		printf '%s\n' "$*" | sqlite3 -bail -batch -separator "$SEP" "$DB"
+	else
+		sqlite3 -bail -batch -separator "$SEP" "$DB"
+	fi | tr -d '\r'
+}
+
+q() { printf "'%s'" "${1//\'/\'\'}"; } # an SQL string literal
+
+commas() { # 1204 -> 1,204
+	local n=$1 out=
+	while ((${#n} > 3)); do
+		out=,${n: -3}$out
+		n=${n:0:${#n}-3}
+	done
+	printf '%s' "$n$out"
+}
+
+plural() { # count word
+	if (($1 == 1)); then printf '%s' "$2"; else printf '%ss' "$2"; fi
+}
+
+sha256() {
+	if command -v sha256sum > /dev/null; then sha256sum < "$1"; else shasum -a 256 < "$1"; fi | cut -d ' ' -f 1
+}
+
+mtime() { stat -c %Y -- "$1" 2> /dev/null || stat -f %m -- "$1"; } # GNU, then BSD
+
+days_ago() { date -d "-$1 days" +%F 2> /dev/null || date -v "-$1d" +%F; }
+
+line() { # name what detail: one row of a command's output
+	((QUIET)) || printf '%-24s %-8s %s\n' "$1" "$2" "$3"
+}
+
+# shellcheck disable=SC2329 # called by the EXIT trap that cmd_run sets
+cleanup() {
+	if [[ -n $TMP ]]; then rm -rf -- "$TMP"; fi
+	if ((LOCKED)); then rm -rf -- "$LOCK"; fi
+}
+
+# ---- Settings file: "key = value" lines and # comments. Read, never sourced, so it cannot run code ----
+
+load_config() {
+	local file=$1 dir line key value n=0
+	[[ -f $file && -r $file ]] || die 1 "cannot read the config file: $file"
+	dir=$(cd -- "$(dirname -- "$file")" && pwd)
+	while IFS= read -r line || [[ -n $line ]]; do
+		n=$((n + 1))
+		line=${line%$'\r'}
+		[[ $line =~ $RE_BLANK ]] && continue
+		[[ $line =~ $RE_SETTING ]] || die 1 "$file:$n: expected 'key = value'"
+		key=${BASH_REMATCH[1]}
+		value=${BASH_REMATCH[2]}
+		value=${value%"${value##*[![:space:]]}"}
+		case $key in
+		inbox | data_dir | schemas)
+			[[ $value == /* ]] || value=$dir/$value # relative to the config file, not to where rampart runs
+			;;&
+		retention_days | settle_seconds | max_errors)
+			[[ $value =~ ^[0-9]+$ ]] || die 1 "$file:$n: $key must be a whole number, got '$value'"
+			;;&
+		inbox) INBOX=$value ;;
+		data_dir) DATA_DIR=$value ;;
+		schemas) SCHEMAS=$value ;;
+		retention_days) RETENTION_DAYS=$value ;;
+		settle_seconds) SETTLE_SECONDS=$value ;;
+		max_errors) MAX_ERRORS=$value ;;
+		webhook_url) WEBHOOK_URL=$value ;;
+		*) die 1 "$file:$n: unknown setting '$key'" ;;
+		esac
+	done < "$file"
+}
+
+# ---- Schemas: one column per line, in the CSV's order ----
+#   name  type  required|optional  [pattern for code, a|b|c for enum]
+# Types: int, decimal, date (YYYY-MM-DD), text, code (matches a regex), enum (one of a list)
+
+read_schema() { # file -> COLS TYPES NEEDS ARGS
+	local file=$1 line name type need arg n=0
+	COLS=() TYPES=() NEEDS=() ARGS=()
+	while IFS= read -r line || [[ -n $line ]]; do
+		n=$((n + 1))
+		line=${line%$'\r'}
+		[[ $line =~ $RE_BLANK ]] && continue
+		name='' type='' need='' arg=''
+		read -r name type need arg <<< "$line"
+		[[ $name =~ ^[a-z][a-z0-9_]*$ ]] || die 1 "$file:$n: column names are lower_snake_case, got '$name'"
+		case $type in
+		int | decimal | date | text) ;;
+		code | enum) [[ -n $arg ]] || die 1 "$file:$n: a $type column needs a pattern or a list of values" ;;
+		*) die 1 "$file:$n: unknown type '$type' (int, decimal, date, text, code or enum)" ;;
+		esac
+		[[ $need == required || $need == optional ]] || die 1 "$file:$n: expected 'required' or 'optional', got '$need'"
+		# The pattern goes through the environment: awk -v would eat its backslashes
+		if [[ $type == code ]] && ! RE=$arg "$AWK" 'BEGIN { if ("" ~ ENVIRON["RE"]) {} }' 2> /dev/null; then
+			die 1 "$file:$n: '$arg' is not a valid pattern"
+		fi
+		COLS+=("$name") TYPES+=("$type") NEEDS+=("$need") ARGS+=("$arg")
+	done < "$file"
+	((${#COLS[@]})) || die 1 "$file: no columns"
+}
+
+write_spec() { # the schema as tab-separated lines for awk
+	local i
+	for i in "${!COLS[@]}"; do
+		printf '%s\t%s\t%s\t%s\n' "${COLS[i]}" "${TYPES[i]}" "${NEEDS[i]}" "${ARGS[i]}"
+	done > "$TMP/spec"
+}
+
+table_sql() { # feed
+	local i cols=
+	for i in "${!COLS[@]}"; do
+		case ${TYPES[i]} in
+		int) cols+="\"${COLS[i]}\" INTEGER, " ;;
+		decimal) cols+="\"${COLS[i]}\" REAL, " ;;
+		*) cols+="\"${COLS[i]}\" TEXT, " ;;
+		esac
+	done
+	printf 'CREATE TABLE IF NOT EXISTS "%s" (%s"_file" TEXT NOT NULL, "_loaded_at" TEXT NOT NULL);\n' "$1" "$cols"
+}
+
+# ---- The checker. One awk program, two modes: "check" reports problems, "sql" (run only on a file
+# that passed) turns each row into an INSERT. Both read the CSV with the same parser, so what was
+# checked is exactly what gets loaded. Regexes avoid {n} so any POSIX awk can run it. ----
+read -r -d '' CHECK_AWK << 'AWK' || true
+function csv(line,    n, i, c, f, q, len) {    # fields into F[1..n]; -1 if a quote never closes
+	if (index(line, "\"") == 0) return split(line, F, ",")
+	n = 0; f = ""; q = 0; len = length(line)
+	for (i = 1; i <= len; i++) {
+		c = substr(line, i, 1)
+		if (q) {
+			if (c != "\"") f = f c
+			else if (substr(line, i + 1, 1) == "\"") { f = f "\""; i++ }
+			else q = 0
+		} else if (c == "\"") q = 1
+		else if (c == ",") { F[++n] = f; f = "" }
+		else f = f c
+	}
+	F[++n] = f
+	return q ? -1 : n
+}
+function is_date(s,    y, m, d, days) {
+	if (s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return 0
+	y = substr(s, 1, 4) + 0; m = substr(s, 6, 2) + 0; d = substr(s, 9, 2) + 0
+	if (m < 1 || m > 12 || d < 1) return 0
+	days = substr("312831303130313130313031", 2 * m - 1, 2) + 0
+	if (m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) days = 29
+	return d <= days
+}
+function problem(row, col, msg) {
+	gsub(/\t/, " ", msg)
+	if (++errors <= maxerr) printf "%d\037%s\037%s\n", row, col, msg
+}
+function sq(s) { gsub(/'/, "''", s); return "'" s "'" }
+BEGIN { FS = "\t"; feed = ENVIRON["RAMPART_FEED"]; file = ENVIRON["RAMPART_FILE"]; stamp = ENVIRON["RAMPART_STAMP"] }
+NR == FNR {    # the schema
+	ncol++; name[ncol] = $1; type[ncol] = $2; need[ncol] = ($3 == "required"); arg[ncol] = $4
+	if ($2 == "enum") { k = split($4, choice, "|"); for (j = 1; j <= k; j++) allowed[ncol, choice[j]] = 1 }
+	next
+}
+{ sub(/\r$/, "") }
+FNR == 1 {    # the header must name the schema's columns, in order
+	sub(/^\357\273\277/, "")
+	n = csv($0); got = ""; want = ""
+	for (i = 1; i <= n; i++) got = got (i > 1 ? "," : "") F[i]
+	for (i = 1; i <= ncol; i++) want = want (i > 1 ? "," : "") name[i]
+	if (got != want) { problem(0, "", "reads '" got "', expected '" want "'"); exit }
+	head = "INSERT INTO \"" feed "\" ("
+	for (i = 1; i <= ncol; i++) head = head "\"" name[i] "\", "
+	head = head "\"_file\", \"_loaded_at\") VALUES ("
+	next
+}
+/^[ \t]*$/ { next }
+{
+	rows++
+	n = csv($0)
+	if (n < 0) { problem(rows, "", "has a quote that never closes"); next }
+	if (n != ncol) { problem(rows, "", "has " n " fields, expected " ncol); next }
+	if (mode == "sql") {
+		out = head
+		for (i = 1; i <= ncol; i++) out = out (F[i] == "" ? "NULL" : (type[i] == "int" || type[i] == "decimal") ? F[i] : sq(F[i])) ", "
+		print out sq(file) ", " sq(stamp) ");"
+		next
+	}
+	for (i = 1; i <= ncol; i++) {
+		v = F[i]
+		if (v == "") { if (need[i]) problem(rows, name[i], "is empty but required"); continue }
+		if (type[i] == "int" && v !~ /^-?[0-9]+$/) problem(rows, name[i], "'" v "' is not a whole number")
+		else if (type[i] == "decimal" && v !~ /^-?[0-9]+(\.[0-9]+)?$/) problem(rows, name[i], "'" v "' is not a number")
+		else if (type[i] == "date" && !is_date(v)) problem(rows, name[i], "'" v "' is not a real date (YYYY-MM-DD)")
+		else if (type[i] == "code" && v !~ arg[i]) problem(rows, name[i], "'" v "' does not match " arg[i])
+		else if (type[i] == "enum" && !((i, v) in allowed)) problem(rows, name[i], "'" v "' is not one of " arg[i])
+	}
+}
+END { if (mode == "check") printf "END\037%d\037%d\n", rows, errors }
+AWK
+
+check_file() { # path -> ROWS ERRORS FIRST, and the problems, one per line, in $TMP/problems
+	local row col msg text ended=0
+	ROWS=0 ERRORS=0 FIRST=
+	: > "$TMP/problems"
+	while IFS=$SEP read -r row col msg; do
+		if [[ $row == END ]]; then
+			ROWS=$col ERRORS=$msg ended=1
+			continue
+		fi
+		if [[ $row == 0 ]]; then
+			text="header $msg"
+		elif [[ -n $col ]]; then
+			text="row $row: $col $msg"
+		else
+			text="row $row: $msg"
+		fi
+		[[ -n $FIRST ]] || FIRST=$text
+		printf '%s\n' "$text" >> "$TMP/problems"
+	done < <(LC_ALL=C "$AWK" -v mode=check -v maxerr="$MAX_ERRORS" "$CHECK_AWK" "$TMP/spec" "$1")
+	((ended)) || die 1 "could not check ${1##*/}: $AWK stopped early"
+}
+
+# ---- The database: one table per feed, and a ledger of every file Rampart has seen ----
+
+init_db() {
+	sql > /dev/null << 'SQL'
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS rampart_ledger (
+	id     INTEGER PRIMARY KEY,
+	file   TEXT NOT NULL,
+	sha256 TEXT NOT NULL,
+	feed   TEXT,
+	rows   INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL CHECK (status IN ('loaded', 'held', 'skipped')),
+	reason TEXT,
+	at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+-- The same content can be loaded once, ever: the database itself refuses a second copy
+CREATE UNIQUE INDEX IF NOT EXISTS rampart_once ON rampart_ledger (sha256) WHERE status = 'loaded';
+SQL
+}
+
+ledger() { # file sha feed rows status reason
+	sql "INSERT INTO rampart_ledger (file, sha256, feed, rows, status, reason) VALUES ($(q "$1"), $(q "$2"), $(q "$3"), $4, $(q "$5"), $(q "$6"));" > /dev/null
+}
+
+loaded_as() { # sha -> "claims_1127.csv on 2026-11-27" if that content was loaded before
+	[[ -f $DB ]] || return 0
+	sql "SELECT file || ' on ' || substr(at, 1, 10) FROM rampart_ledger WHERE sha256 = $(q "$1") AND status = 'loaded' LIMIT 1;"
+}
+
+# The rows, the table and the ledger entry go in as one transaction: a file is loaded whole or not at all
+load_file() { # path feed sha
+	{
+		printf 'BEGIN;\n'
+		table_sql "$2"
+		RAMPART_FEED=$2 RAMPART_FILE=${1##*/} RAMPART_STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+			LC_ALL=C "$AWK" -v mode=sql "$CHECK_AWK" "$TMP/spec" "$1"
+		printf "INSERT INTO rampart_ledger (file, sha256, feed, rows, status) VALUES (%s, %s, %s, %d, 'loaded');\n" \
+			"$(q "${1##*/}")" "$(q "$3")" "$(q "$2")" "$ROWS"
+		printf 'COMMIT;\n'
+	} > "$TMP/load.sql"
+	sql < "$TMP/load.sql" > /dev/null 2> "$TMP/load.err"
+}
+
+# ---- Moving files out of the inbox ----
+
+free_name() { # dir name -> a path in dir that is not taken yet (a gzipped copy counts as taken)
+	local try=$1/$2 n=1
+	while [[ -e $try || -e $try.gz ]]; do
+		try=$1/${2%.*}.$n.${2##*.}
+		n=$((n + 1))
+	done
+	printf '%s' "$try"
+}
+
+archive_file() { # path: into today's archive folder, gzipped
+	local dir dest
+	dir=$ARCHIVE/$(date +%F)
+	mkdir -p -- "$dir"
+	dest=$(free_name "$dir" "${1##*/}")
+	mv -- "$1" "$dest"
+	gzip -- "$dest"
+}
+
+hold() { # path sha feed rows reason [problems]: into quarantine, with a note saying why
+	local base=${1##*/} dest what=held
+	HELD=$((HELD + 1))
+	((DRY_RUN == 0)) || what="to hold"
+	line "$base" "$what" "$5"
+	((DRY_RUN == 0)) || return 0
+	dest=$(free_name "$QUARANTINE" "$base")
+	mv -- "$1" "$dest"
+	{
+		printf 'file      %s\nsha256    %s\nheld at   %s\nreason    %s\n' "$base" "$2" "$(date '+%Y-%m-%d %H:%M:%S %z')" "$5"
+		if [[ -n ${6:-} && -s ${6:-} ]]; then
+			printf '\nproblems (up to %d):\n' "$MAX_ERRORS"
+			cat -- "$6"
+		fi
+	} > "$dest.reason.txt"
+	ledger "$base" "$2" "$3" "$4" held "$5"
+	log WARN "held $base: $5"
+}
+
+skip() { # path sha feed reason: already loaded, so archived without loading
+	local base=${1##*/} what=skipped
+	SKIPPED=$((SKIPPED + 1))
+	((DRY_RUN == 0)) || what="to skip"
+	line "$base" "$what" "$4"
+	((DRY_RUN == 0)) || return 0
+	archive_file "$1"
+	ledger "$base" "$2" "$3" 0 skipped "$4"
+	log INFO "skipped $base: $4"
+}
+
+# ---- One file, start to finish ----
+
+process() { # path
+	local path=$1 base=${1##*/} feed hash dup more=
+	# A file that changed in the last few seconds may still be arriving
+	if (($(date +%s) - $(mtime "$path") < SETTLE_SECONDS)); then
+		WAITING=$((WAITING + 1))
+		line "$base" waiting "still arriving, will try on the next run"
+		return 0
+	fi
+	feed=${base%.*}
+	feed=${feed%%_*}
+	feed=${feed,,}
+	hash=$(sha256 "$path")
+	dup=$(loaded_as "$hash")
+	if [[ -n $dup ]]; then
+		skip "$path" "$hash" "$feed" "already loaded as $dup"
+		return 0
+	fi
+	if [[ ! $feed =~ ^[a-z][a-z0-9]*$ ]]; then
+		hold "$path" "$hash" "" 0 "the name should start with its feed, like claims_1127.csv"
+		return 0
+	fi
+	if [[ ! -f $SCHEMAS/$feed.schema ]]; then
+		hold "$path" "$hash" "$feed" 0 "no schema for the '$feed' feed ($SCHEMAS/$feed.schema)"
+		return 0
+	fi
+	read_schema "$SCHEMAS/$feed.schema"
+	write_spec
+	check_file "$path"
+	if ((ERRORS)); then
+		((ERRORS == 1)) || more=" (and $((ERRORS - 1)) more)"
+		hold "$path" "$hash" "$feed" "$ROWS" "$FIRST$more" "$TMP/problems"
+		return 0
+	fi
+	if ((ROWS == 0)); then
+		hold "$path" "$hash" "$feed" 0 "no data rows under the header"
+		return 0
+	fi
+	if ((DRY_RUN)); then
+		LOADED=$((LOADED + 1)) LOADED_ROWS=$((LOADED_ROWS + ROWS))
+		line "$base" "to load" "$(commas "$ROWS") $(plural "$ROWS" row) into $feed"
+		return 0
+	fi
+	if ! load_file "$path" "$feed" "$hash"; then
+		hold "$path" "$hash" "$feed" "$ROWS" "the database refused it: $(head -n 1 "$TMP/load.err")"
+		return 0
+	fi
+	archive_file "$path"
+	LOADED=$((LOADED + 1)) LOADED_ROWS=$((LOADED_ROWS + ROWS))
+	log INFO "loaded $base: $ROWS rows into $feed (sha256 ${hash:0:12})"
+	line "$base" loaded "$(commas "$ROWS") $(plural "$ROWS" row)"
+}
+
+# ---- Commands ----
+
+prepare() {
+	[[ -d $INBOX ]] || die 1 "no inbox at $INBOX (run '$PROG init' to create it)"
+	((DRY_RUN == 0)) || return 0
+	mkdir -p -- "$ARCHIVE" "$QUARANTINE" "$LOGS"
+	init_db
+}
+
+# One run at a time. mkdir is atomic on every filesystem, unlike checking for a file and then
+# creating it; a lock whose process is gone is cleared
+take_lock() {
+	local pid
+	if ! mkdir -- "$LOCK" 2> /dev/null; then
+		pid=$(cat -- "$LOCK/pid" 2> /dev/null || true)
+		if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2> /dev/null; then
+			die 3 "another run is in progress (pid $pid)"
+		fi
+		log WARN "clearing a stale lock left by pid ${pid:-unknown}"
+		rm -rf -- "$LOCK"
+		mkdir -- "$LOCK" 2> /dev/null || die 3 "could not take the lock at $LOCK"
+	fi
+	printf '%s\n' "$$" > "$LOCK/pid"
+	LOCKED=1
+}
+
+summary() {
+	local total=$((LOADED + SKIPPED + HELD + WAITING)) out='' p verb=loaded parts=()
+	((QUIET == 0)) || return 0
+	((DRY_RUN == 0)) || verb="to load"
+	((LOADED == 0)) || parts+=("$LOADED $verb ($(commas "$LOADED_ROWS") $(plural "$LOADED_ROWS" row))")
+	((SKIPPED == 0)) || parts+=("$SKIPPED skipped")
+	((HELD == 0)) || parts+=("$HELD held")
+	((WAITING == 0)) || parts+=("$WAITING still arriving")
+	for p in "${parts[@]}"; do out+=${out:+, }$p; done
+	printf '%d %s: %s\n' "$total" "$(plural "$total" file)" "$out"
+}
+
+cmd_run() {
+	need sqlite3
+	[[ -n $AWK ]] || die 4 "awk is required but was not found"
+	trap cleanup EXIT
+	prepare
+	((DRY_RUN)) || take_lock
+	TMP=$(mktemp -d "${TMPDIR:-/tmp}/rampart.XXXXXX")
+	LOADED=0 LOADED_ROWS=0 SKIPPED=0 HELD=0 WAITING=0
+	local files=("$INBOX"/*.csv "$INBOX"/*.CSV) f
+	if ((${#files[@]} == 0)); then
+		((QUIET || WATCHING)) || printf 'nothing waiting in %s\n' "$INBOX"
+		return 0
+	fi
+	log INFO "run: ${#files[@]} $(plural "${#files[@]}" file) waiting"
+	for f in "${files[@]}"; do
+		process "$f"
+	done
+	summary
+	((HELD == 0)) || return 2
+}
+
+cmd_watch() {
+	local stop=0 status
+	WATCHING=1 # an empty inbox is the normal state between drops, so quiet ticks print nothing
+	trap 'stop=1' INT TERM
+	((QUIET)) || printf 'watching %s every %ds, Ctrl+C to stop\n' "$INBOX" "$INTERVAL"
+	while ((stop == 0)); do
+		status=0
+		(cmd_run) || status=$?
+		((status == 0 || status == 2)) || log WARN "a run ended with status $status"
+		((stop == 0)) || break
+		sleep "$INTERVAL" &
+		wait $! || true
+		kill $! 2> /dev/null || true
+	done
+	log INFO "watch stopped"
+}
+
+report_section() { # status title
+	local file reason n=0 rows=()
+	while IFS=$SEP read -r file reason; do
+		rows+=("$(printf '           %s: %s' "$file" "$reason")")
+		n=$((n + 1))
+	done < <(sql "SELECT file, reason FROM rampart_ledger WHERE status = '$1' AND at >= $(q "$SINCE") ORDER BY id;")
+	if ((n == 0)); then
+		printf '%-9s none\n' "$2"
+	else
+		printf '%-9s %d %s\n' "$2" "$n" "$(plural "$n" file)"
+		printf '%s\n' "${rows[@]}"
+	fi
+}
+
+report_text() {
+	local feed files rows n=0 total=0 detail=()
+	printf 'Rampart report since %s (UTC)\n\n' "$SINCE"
+	while IFS=$SEP read -r feed files rows; do
+		detail+=("$(printf '           %-10s %2d %-6s %10s %s' "$feed" "$files" "$(plural "$files" file)" "$(commas "$rows")" "$(plural "$rows" row)")")
+		n=$((n + files)) total=$((total + rows))
+	done < <(sql "SELECT feed, COUNT(*), SUM(rows) FROM rampart_ledger WHERE status = 'loaded' AND at >= $(q "$SINCE") GROUP BY feed ORDER BY feed;")
+	if ((n == 0)); then
+		printf '%-9s none\n' loaded
+	else
+		printf '%-9s %d %s, %s %s\n' loaded "$n" "$(plural "$n" file)" "$(commas "$total")" "$(plural "$total" row)"
+		printf '%s\n' "${detail[@]}"
+	fi
+	report_section held held
+	report_section skipped skipped
+}
+
+json_escape() {
+	local s=$1
+	s=${s//\\/\\\\}
+	s=${s//\"/\\\"}
+	s=${s//$'\n'/\\n}
+	s=${s//$'\r'/\\r}
+	s=${s//$'\t'/\\t}
+	printf '%s' "$s"
+}
+
+# Slack and Teams incoming webhooks both take {"text": ...}. The URL is a secret, so it is never logged
+post() { # text
+	local url=${RAMPART_WEBHOOK:-$WEBHOOK_URL}
+	need curl
+	[[ -n $url ]] || die 1 "no webhook to post to: set webhook_url in the config or RAMPART_WEBHOOK"
+	printf '{"text": "%s"}' "$(json_escape "$1")" |
+		curl -fsS --retry 3 --retry-delay 2 --max-time 20 -H 'Content-Type: application/json' --data-binary @- "$url" > /dev/null ||
+		die 1 "could not post the report to the webhook"
+	log INFO "report posted to the webhook"
+}
+
+cmd_report() {
+	local text
+	need sqlite3
+	[[ -f $DB ]] || die 1 "nothing has run yet: no database at $DB"
+	SINCE=${SINCE:-$(date -u +%F)}
+	text=$(report_text)
+	((QUIET)) || printf '%s\n' "$text"
+	((POST == 0)) || post "$text"
+}
+
+cmd_prune() {
+	local keep=${DAYS:-$RETENTION_DAYS} cutoff dir day n=0 verb=removed what=removed
+	cutoff=$(days_ago "$keep")
+	if ((DRY_RUN)); then
+		verb="would remove"
+		what="to remove"
+	fi
+	for dir in "$ARCHIVE"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+		day=${dir##*/}
+		[[ -d $dir && $day < $cutoff ]] || continue
+		n=$((n + 1))
+		if ((DRY_RUN == 0)); then
+			rm -rf -- "$dir"
+			write_log INFO "pruned archive day $day"
+		fi
+		line "$day" "$what" "archive day"
+	done
+	((QUIET)) || printf '%s %d archive %s older than %s\n' "$verb" "$n" "$(plural "$n" day)" "$cutoff"
+}
+
+cmd_doctor() {
+	local bad=0 f
+	local -a schemas
+	pass() { printf '  ok     %s\n' "$1"; }
+	fail() {
+		printf '  fail   %s\n' "$1"
+		bad=1
+	}
+	printf 'rampart %s\n' "$VERSION"
+	if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then pass "bash $BASH_VERSION"; else fail "bash 4.4 or newer is needed (this is $BASH_VERSION)"; fi
+	if [[ -n $AWK ]]; then pass "awk: $AWK"; else fail "awk was not found"; fi
+	if command -v sqlite3 > /dev/null; then pass "sqlite3 $(sqlite3 --version | cut -d ' ' -f 1)"; else fail "sqlite3 was not found"; fi
+	if command -v sha256sum > /dev/null || command -v shasum > /dev/null; then pass "sha256"; else fail "sha256sum or shasum was not found"; fi
+	if command -v gzip > /dev/null; then pass gzip; else fail "gzip was not found"; fi
+	if command -v curl > /dev/null; then pass "curl, for report --post"; else printf '  note   curl was not found, so report --post will not work\n'; fi
+	if [[ -d $INBOX ]]; then pass "inbox $INBOX"; else fail "no inbox at $INBOX (run '$PROG init')"; fi
+	schemas=("$SCHEMAS"/*.schema)
+	if ((${#schemas[@]} == 0)); then fail "no schemas in $SCHEMAS"; fi
+	for f in "${schemas[@]}"; do
+		if (read_schema "$f") 2> /dev/null; then
+			pass "schema ${f##*/}"
+		else
+			fail "schema ${f##*/}: $( (read_schema "$f") 2>&1 | sed "s/^$PROG: //")"
+		fi
+	done
+	if ((bad)); then return 4; fi
+	printf 'all good\n'
+}
+
+cmd_init() {
+	need sqlite3
+	mkdir -p -- "$INBOX" "$SCHEMAS" "$ARCHIVE" "$QUARANTINE" "$LOGS"
+	init_db
+	printf 'ready\n  inbox    %s\n  schemas  %s\n  data     %s\n' "$INBOX" "$SCHEMAS" "$DATA_DIR"
+}
+
+main() {
+	local cmd='' status=0
+	while (($#)); do
+		case $1 in
+		-c | --config)
+			[[ $# -ge 2 ]] || die 1 "$1 needs a file"
+			CONFIG=$2
+			shift
+			;;
+		-n | --dry-run) DRY_RUN=1 ;;
+		-v | --verbose) VERBOSE=1 ;;
+		-q | --quiet) QUIET=1 ;;
+		--post) POST=1 ;;
+		--since)
+			[[ ${2:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die 1 "--since needs a day like 2026-11-27"
+			SINCE=$2
+			shift
+			;;
+		--days)
+			[[ ${2:-} =~ ^[0-9]+$ ]] || die 1 "--days needs a whole number"
+			DAYS=$2
+			shift
+			;;
+		--interval)
+			[[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die 1 "--interval needs a number of seconds"
+			INTERVAL=$2
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		-V | --version)
+			printf 'rampart %s\n' "$VERSION"
+			exit 0
+			;;
+		-*) die 1 "unknown option '$1' (see $PROG --help)" ;;
+		*)
+			[[ -z $cmd ]] || die 1 "one command at a time, got '$cmd' and '$1'"
+			cmd=$1
+			;;
+		esac
+		shift
+	done
+	if [[ -z $cmd ]]; then
+		usage >&2
+		exit 1
+	fi
+	if [[ -z $CONFIG && -f ./rampart.conf ]]; then CONFIG=./rampart.conf; fi
+	if [[ -n $CONFIG ]]; then load_config "$CONFIG"; fi
+	DB=$DATA_DIR/rampart.db ARCHIVE=$DATA_DIR/archive QUARANTINE=$DATA_DIR/quarantine
+	LOGS=$DATA_DIR/logs LOCK=$DATA_DIR/.lock
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	case $cmd in
+	run) cmd_run || status=$? ;;
+	watch) cmd_watch || status=$? ;;
+	report) cmd_report || status=$? ;;
+	prune) cmd_prune || status=$? ;;
+	doctor) cmd_doctor || status=$? ;;
+	init) cmd_init || status=$? ;;
+	help) usage ;;
+	*) die 1 "unknown command '$cmd' (see $PROG --help)" ;;
+	esac
+	exit "$status"
+}
+
+trap 'printf "%s: unexpected failure at line %s\n" "$PROG" "$LINENO" >&2' ERR
+main "$@"

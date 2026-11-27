@@ -1,0 +1,9 @@
+# Claim lines, one per row, as a practice management system exports them.
+# name          type      required?  pattern, or allowed values separated by |
+claim_id        int       required
+patient_id      code      required   ^P[0-9][0-9][0-9][0-9][0-9][0-9]$
+payer           enum      required   Medicare|Medicaid|Anthem BCBS|Healthfirst|NYCE PPO
+cpt             code      required   ^[0-9][0-9][0-9][0-9][0-9]$
+icd10           code      required   ^[A-Z][0-9][0-9A-Z](\.[0-9A-Z]+)?$
+billed          decimal   required
+service_date    date      required

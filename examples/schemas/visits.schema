@@ -1,0 +1,7 @@
+# Patient visits from the scheduling system, one per row.
+# name          type      required?  pattern, or allowed values separated by |
+visit_id        int       required
+patient_id      code      required   ^P[0-9][0-9][0-9][0-9][0-9][0-9]$
+provider_npi    code      required   ^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$
+visit_date      date      required
+visit_type      enum      required   new|follow-up|telehealth

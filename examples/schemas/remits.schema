@@ -1,0 +1,9 @@
+# Payments back from payers, one claim per row, flattened from 835 remittance files.
+# name          type      required?  pattern, or allowed values separated by |
+claim_id        int       required
+payer           enum      required   Medicare|Medicaid|Anthem BCBS|Healthfirst|NYCE PPO
+paid            decimal   required
+adjustment      decimal   optional
+carc            code      optional   ^(CO|PR|OA|PI)-[0-9]+$
+service_date    date      required
+paid_date       date      required

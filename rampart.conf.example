@@ -1,0 +1,24 @@
+# Rampart settings. Copy to rampart.conf and change what you need.
+# Relative paths are relative to this file, wherever rampart is started from.
+
+# Where new files arrive. A file named claims_1127.csv belongs to the "claims" feed.
+inbox = inbox
+
+# One schema per feed: schemas/claims.schema checks every claims_*.csv
+schemas = schemas
+
+# The database, the archive, the quarantine and the log all live here
+data_dir = var
+
+# Archived files older than this are deleted by "rampart prune"
+retention_days = 30
+
+# A file that changed less than this many seconds ago may still be copying in, so it waits a run
+settle_seconds = 5
+
+# The most problems listed in a held file's note
+max_errors = 20
+
+# Where "rampart report --post" sends the report: a Slack or Teams incoming webhook.
+# Keep the real URL out of version control; the RAMPART_WEBHOOK environment variable works too.
+# webhook_url = https://hooks.slack.com/services/...
